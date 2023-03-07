@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"container/list"
 	"encoding/json"
+	"errors"
 	"flag"
 	"github.com/eatmoreapple/openwechat"
 	"io/ioutil"
@@ -93,16 +94,17 @@ func ImagesGenerations(msg string, role string, group string) (string, error) {
 	var reply string
 	if _, ok := gptResponseBody.Error["message"]; ok {
 		reply = gptResponseBody.Error["message"].(string)
-	} else {
-		if len(gptResponseBody.Data) > 0 {
-			for _, v := range gptResponseBody.Data {
-				if _, ok := v["url"]; ok {
-					reply = v["url"].(string)
-				}
-				break
+		return reply, errors.New(reply)
+	}
+	if len(gptResponseBody.Data) > 0 {
+		for _, v := range gptResponseBody.Data {
+			if _, ok := v["url"]; ok {
+				reply = v["url"].(string)
 			}
+			break
 		}
 	}
+
 	return reply, nil
 }
 
@@ -163,32 +165,33 @@ func ChatCompletions(msg string, role string, group string) (string, error) {
 	var reply string
 	if _, ok := gptResponseBody.Error["message"]; ok {
 		reply = gptResponseBody.Error["message"].(string)
-	} else {
-		if len(gptResponseBody.Choices) > 0 {
-			for _, v := range gptResponseBody.Choices {
-				if _, ok := v["message"]; ok {
-					if _, ok := v["message"].(map[string]interface{})["content"]; ok {
-						replyMsg := ChatGPTMessage{
-							Role:    v["message"].(map[string]interface{})["role"].(string),
-							Content: v["message"].(map[string]interface{})["content"].(string),
-						}
-						reply = replyMsg.Content
-						l.Lock()
-						if _, ok := msgListMap[group]; !ok {
-							msgListMap[group] = list.New()
-						}
-						log.Printf("msgListMap[group].len = %d", msgListMap[group].Len())
-						if msgListMap[group].Len() == 10 {
-							msgListMap[group].Remove(msgListMap[group].Front())
-						}
-						msgListMap[group].PushBack(replyMsg)
-						l.Unlock()
-						break
+		return reply, errors.New(reply)
+	}
+	if len(gptResponseBody.Choices) > 0 {
+		for _, v := range gptResponseBody.Choices {
+			if _, ok := v["message"]; ok {
+				if _, ok := v["message"].(map[string]interface{})["content"]; ok {
+					replyMsg := ChatGPTMessage{
+						Role:    v["message"].(map[string]interface{})["role"].(string),
+						Content: v["message"].(map[string]interface{})["content"].(string),
 					}
+					reply = replyMsg.Content
+					l.Lock()
+					if _, ok := msgListMap[group]; !ok {
+						msgListMap[group] = list.New()
+					}
+					log.Printf("msgListMap[group].len = %d", msgListMap[group].Len())
+					if msgListMap[group].Len() == 10 {
+						msgListMap[group].Remove(msgListMap[group].Front())
+					}
+					msgListMap[group].PushBack(replyMsg)
+					l.Unlock()
+					break
 				}
 			}
 		}
 	}
+
 	// log.Printf("gpt response text: %s \n", reply)
 	return reply, nil
 }
