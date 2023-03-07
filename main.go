@@ -4,13 +4,13 @@ import (
 	"bytes"
 	"container/list"
 	"encoding/json"
+	"flag"
 	"github.com/eatmoreapple/openwechat"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"strings"
 	"sync"
-	"flag"
 )
 
 type ChatGPTResponseBody struct {
@@ -20,6 +20,7 @@ type ChatGPTResponseBody struct {
 	Model   string                   `json:"model"`
 	Choices []map[string]interface{} `json:"choices"`
 	Usage   map[string]interface{}   `json:"usage"`
+	Error   map[string]interface{}   `json:"error"`
 }
 
 type ChoiceItem struct {
@@ -36,11 +37,74 @@ type ChatGPTRequestBody struct {
 	Temperature float32          `json:"temperature"`
 }
 
+type ImageGenRequestBody struct {
+	Prompt string `json:"prompt"`
+	N      int    `json:"n"`
+	Size   string `json:"size"`
+}
+
+type ImageGenResponseBody struct {
+	Created int                      `json:"created"`
+	Data    []map[string]interface{} `json:"data"`
+	Error   map[string]interface{}   `json:"error"`
+}
+
 var l sync.Mutex
 var msgListMap = make(map[string]*list.List)
 var apiKey string
 var groupIdOnly string
 var storagePath string
+
+func ImagesGenerations(msg string, role string, group string) (string, error) {
+	requestBody := ImageGenRequestBody{
+		Prompt: msg,
+		N:      1,
+		Size:   "1024x1024",
+	}
+	requestData, err := json.Marshal(requestBody)
+	if err != nil {
+		return "", err
+	}
+	log.Printf("request gtp json string : %v", string(requestData))
+	req, err := http.NewRequest("POST", "https://api.openai.com/v1/images/generations", bytes.NewBuffer(requestData))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	client := &http.Client{}
+	response, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+
+	body, err := ioutil.ReadAll(response.Body)
+	if err != nil {
+		return "", err
+	}
+
+	gptResponseBody := &ImageGenResponseBody{}
+	log.Println(string(body))
+	err = json.Unmarshal(body, gptResponseBody)
+	if err != nil {
+		return "", err
+	}
+	var reply string
+	if _, ok := gptResponseBody.Error["message"]; ok {
+		reply = gptResponseBody.Error["message"].(string)
+	} else {
+		if len(gptResponseBody.Data) > 0 {
+			for _, v := range gptResponseBody.Data {
+				if _, ok := v["url"]; ok {
+					reply = v["url"].(string)
+				}
+				break
+			}
+		}
+	}
+	return reply, nil
+}
 
 func ChatCompletions(msg string, role string, group string) (string, error) {
 	message := ChatGPTMessage{
@@ -68,7 +132,6 @@ func ChatCompletions(msg string, role string, group string) (string, error) {
 		Temperature: 0.2,
 	}
 	requestData, err := json.Marshal(requestBody)
-
 	if err != nil {
 		return "", err
 	}
@@ -79,14 +142,13 @@ func ChatCompletions(msg string, role string, group string) (string, error) {
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+ apiKey)
+	req.Header.Set("Authorization", "Bearer "+apiKey)
 	client := &http.Client{}
 	response, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer response.Body.Close()
-
 	body, err := ioutil.ReadAll(response.Body)
 	if err != nil {
 		return "", err
@@ -99,26 +161,30 @@ func ChatCompletions(msg string, role string, group string) (string, error) {
 		return "", err
 	}
 	var reply string
-	if len(gptResponseBody.Choices) > 0 {
-		for _, v := range gptResponseBody.Choices {
-			if _, ok := v["message"]; ok {
-				if _, ok := v["message"].(map[string]interface{})["content"]; ok {
-					replyMsg := ChatGPTMessage{
-						Role:    v["message"].(map[string]interface{})["role"].(string),
-						Content: v["message"].(map[string]interface{})["content"].(string),
+	if _, ok := gptResponseBody.Error["message"]; ok {
+		reply = gptResponseBody.Error["message"].(string)
+	} else {
+		if len(gptResponseBody.Choices) > 0 {
+			for _, v := range gptResponseBody.Choices {
+				if _, ok := v["message"]; ok {
+					if _, ok := v["message"].(map[string]interface{})["content"]; ok {
+						replyMsg := ChatGPTMessage{
+							Role:    v["message"].(map[string]interface{})["role"].(string),
+							Content: v["message"].(map[string]interface{})["content"].(string),
+						}
+						reply = replyMsg.Content
+						l.Lock()
+						if _, ok := msgListMap[group]; !ok {
+							msgListMap[group] = list.New()
+						}
+						log.Printf("msgListMap[group].len = %d", msgListMap[group].Len())
+						if msgListMap[group].Len() == 10 {
+							msgListMap[group].Remove(msgListMap[group].Front())
+						}
+						msgListMap[group].PushBack(replyMsg)
+						l.Unlock()
+						break
 					}
-					reply = replyMsg.Content
-					l.Lock()
-					if _, ok := msgListMap[group]; !ok {
-					    msgListMap[group] = list.New()
-				    }
-					log.Printf("msgListMap[group].len = %d", msgListMap[group].Len())
-					if msgListMap[group].Len() == 10 {
-						msgListMap[group].Remove(msgListMap[group].Front())
-					}
-					msgListMap[group].PushBack(replyMsg)
-					l.Unlock()
-					break
 				}
 			}
 		}
@@ -149,7 +215,18 @@ func ReplyText(msg *openwechat.Message) error {
 		requestText = strings.TrimSpace(strings.ReplaceAll(requestText, "[system]", ""))
 		role = "system"
 	}
-	reply, err := ChatCompletions(requestText, role, msg.FromUserName)
+	images := false
+	if strings.HasPrefix(requestText, "[images]") == true {
+		requestText = strings.TrimSpace(strings.ReplaceAll(requestText, "[images]", ""))
+		images = true
+	}
+	var reply string
+	var err error
+	if images == true {
+		reply, err = ImagesGenerations(requestText, role, msg.FromUserName)
+	} else {
+		reply, err = ChatCompletions(requestText, role, msg.FromUserName)
+	}
 	if err != nil {
 		log.Printf("gtp request error: %v \n", err)
 		msg.ReplyText("gtp request error. " + err.Error())
@@ -161,12 +238,29 @@ func ReplyText(msg *openwechat.Message) error {
 	}
 
 	// 回复
-	reply = strings.TrimSpace(reply)
-	reply = strings.Trim(reply, "\n")
-	replyText := reply
-	_, err = msg.ReplyText(replyText)
-	if err != nil {
-		log.Printf("response group error: %v \n", err)
+	if err == nil && images == true {
+		req, err := http.NewRequest("GET", reply, nil)
+		if err != nil {
+			return err
+		}
+		client := &http.Client{}
+		rsp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		defer rsp.Body.Close()
+		_, err = msg.ReplyImage(rsp.Body)
+		if err != nil {
+			log.Printf("response group error: %v \n", err)
+		}
+	} else {
+		reply = strings.TrimSpace(reply)
+		reply = strings.Trim(reply, "\n")
+		replyText := reply
+		_, err = msg.ReplyText(replyText)
+		if err != nil {
+			log.Printf("response group error: %v \n", err)
+		}
 	}
 	return err
 }
