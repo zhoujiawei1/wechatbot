@@ -211,18 +211,19 @@ func ReplyText(msg *openwechat.Message) error {
 	receiver, _ := msg.Receiver()
 	// 替换掉@文本，然后向GPT发起请求
 	replaceText := "@" + receiver.Self().NickName
-	requestText := strings.TrimSpace(strings.ReplaceAll(msg.Content, replaceText, ""))
+	requestText := strings.ReplaceAll(msg.Content, replaceText, "")
 	// log.Printf("replace : %s|%s|%s", msg.Content, replaceText, requestText)
 	role := "user"
 	if strings.HasPrefix(requestText, "[system]") == true {
-		requestText = strings.TrimSpace(strings.ReplaceAll(requestText, "[system]", ""))
+		requestText = strings.ReplaceAll(requestText, "[system]", "")
 		role = "system"
 	}
 	images := false
 	if strings.HasPrefix(requestText, "[images]") == true {
-		requestText = strings.TrimSpace(strings.ReplaceAll(requestText, "[images]", ""))
+		requestText = strings.ReplaceAll(requestText, "[images]", "")
 		images = true
 	}
+	requestText = strings.TrimSpace(requestText)
 	var reply string
 	var err error
 	if images == true {
