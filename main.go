@@ -56,59 +56,58 @@ var apiKey string
 var groupIdOnly string
 var storagePath string
 
-func ImagesGenerations(msg string, role string, group string) (string, error) {
+func ImagesGenerations(msg string, role string, group string) ([]string, error) {
 	requestBody := ImageGenRequestBody{
 		Prompt: msg,
-		N:      1,
+		N:      4,
 		Size:   "1024x1024",
 	}
 	requestData, err := json.Marshal(requestBody)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	log.Printf("request gtp json string : %v", string(requestData))
 	req, err := http.NewRequest("POST", "https://api.openai.com/v1/images/generations", bytes.NewBuffer(requestData))
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	client := &http.Client{}
 	response, err := client.Do(req)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer response.Body.Close()
 
 	body, err := ioutil.ReadAll(response.Body)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	gptResponseBody := &ImageGenResponseBody{}
 	log.Println(string(body))
 	err = json.Unmarshal(body, gptResponseBody)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	var reply string
+	var reply []string
 	if _, ok := gptResponseBody.Error["message"]; ok {
-		reply = gptResponseBody.Error["message"].(string)
-		return reply, errors.New(reply)
+		reply = append(reply, gptResponseBody.Error["message"].(string))
+		return reply, errors.New(gptResponseBody.Error["message"].(string))
 	}
 	if len(gptResponseBody.Data) > 0 {
 		for _, v := range gptResponseBody.Data {
 			if _, ok := v["url"]; ok {
-				reply = v["url"].(string)
+				reply = append(reply, v["url"].(string))
 			}
-			break
 		}
 	}
 
 	return reply, nil
 }
 
-func ChatCompletions(msg string, role string, group string) (string, error) {
+func ChatCompletions(msg string, role string, group string) ([]string, error) {
 	message := ChatGPTMessage{
 		Role:    role,
 		Content: msg,
@@ -135,12 +134,12 @@ func ChatCompletions(msg string, role string, group string) (string, error) {
 	}
 	requestData, err := json.Marshal(requestBody)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	log.Printf("request gtp json string : %v", string(requestData))
 	req, err := http.NewRequest("POST", "https://api.openai.com/v1/chat/completions", bytes.NewBuffer(requestData))
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -148,24 +147,24 @@ func ChatCompletions(msg string, role string, group string) (string, error) {
 	client := &http.Client{}
 	response, err := client.Do(req)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer response.Body.Close()
 	body, err := ioutil.ReadAll(response.Body)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	gptResponseBody := &ChatGPTResponseBody{}
 	log.Println(string(body))
 	err = json.Unmarshal(body, gptResponseBody)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	var reply string
+	var reply []string
 	if _, ok := gptResponseBody.Error["message"]; ok {
-		reply = gptResponseBody.Error["message"].(string)
-		return reply, errors.New(reply)
+		reply = append(reply, gptResponseBody.Error["message"].(string))
+		return reply, errors.New(gptResponseBody.Error["message"].(string))
 	}
 	if len(gptResponseBody.Choices) > 0 {
 		for _, v := range gptResponseBody.Choices {
@@ -175,7 +174,7 @@ func ChatCompletions(msg string, role string, group string) (string, error) {
 						Role:    v["message"].(map[string]interface{})["role"].(string),
 						Content: v["message"].(map[string]interface{})["content"].(string),
 					}
-					reply = replyMsg.Content
+					reply = append(reply, replyMsg.Content)
 					l.Lock()
 					if _, ok := msgListMap[group]; !ok {
 						msgListMap[group] = list.New()
@@ -191,8 +190,6 @@ func ChatCompletions(msg string, role string, group string) (string, error) {
 			}
 		}
 	}
-
-	// log.Printf("gpt response text: %s \n", reply)
 	return reply, nil
 }
 
@@ -223,46 +220,50 @@ func ReplyText(msg *openwechat.Message) error {
 		requestText = strings.TrimSpace(strings.ReplaceAll(requestText, "[images]", ""))
 		images = true
 	}
-	var reply string
+	var replys []string
 	var err error
 	if images == true {
-		reply, err = ImagesGenerations(requestText, role, msg.FromUserName)
+		replys, err = ImagesGenerations(requestText, role, msg.FromUserName)
 	} else {
-		reply, err = ChatCompletions(requestText, role, msg.FromUserName)
+		replys, err = ChatCompletions(requestText, role, msg.FromUserName)
 	}
 	if err != nil {
 		log.Printf("gtp request error: %v \n", err)
 		msg.ReplyText("gtp request error. " + err.Error())
 		return err
 	}
-	if reply == "" {
+	if len(replys) == 0 {
 		msg.ReplyText("reply nothing.")
 		return nil
 	}
 
 	// 回复
-	if err == nil && images == true {
-		req, err := http.NewRequest("GET", reply, nil)
-		if err != nil {
-			return err
-		}
-		client := &http.Client{}
-		rsp, err := client.Do(req)
-		if err != nil {
-			return err
-		}
-		defer rsp.Body.Close()
-		_, err = msg.ReplyImage(rsp.Body)
-		if err != nil {
-			log.Printf("response group error: %v \n", err)
-		}
-	} else {
-		reply = strings.TrimSpace(reply)
-		reply = strings.Trim(reply, "\n")
-		replyText := reply
-		_, err = msg.ReplyText(replyText)
-		if err != nil {
-			log.Printf("response group error: %v \n", err)
+	for _, reply := range replys {
+		if err == nil && images == true {
+			req, err := http.NewRequest("GET", reply, nil)
+			if err != nil {
+				return err
+			}
+			client := &http.Client{}
+			rsp, err := client.Do(req)
+			if err != nil {
+				return err
+			}
+			defer rsp.Body.Close()
+			_, err = msg.ReplyImage(rsp.Body)
+			if err != nil {
+				log.Printf("response group error: %v \n", err)
+				return err
+			}
+		} else {
+			reply = strings.TrimSpace(reply)
+			reply = strings.Trim(reply, "\n")
+			replyText := reply
+			_, err = msg.ReplyText(replyText)
+			if err != nil {
+				log.Printf("response group error: %v \n", err)
+				return err
+			}
 		}
 	}
 	return err
