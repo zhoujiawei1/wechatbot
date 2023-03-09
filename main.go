@@ -1,114 +1,51 @@
 package main
 
 import (
-	"bytes"
+	// "bytes"
 	"container/list"
-	"encoding/json"
-	"errors"
+	"context"
+	// "encoding/json"
+	// "errors"
 	"flag"
 	"github.com/eatmoreapple/openwechat"
-	"io/ioutil"
+	openai "github.com/sashabaranov/go-openai"
+	// "io/ioutil"
 	"log"
 	"net/http"
 	"strings"
 	"sync"
 )
 
-type ChatGPTResponseBody struct {
-	ID      string                   `json:"id"`
-	Object  string                   `json:"object"`
-	Created int                      `json:"created"`
-	Model   string                   `json:"model"`
-	Choices []map[string]interface{} `json:"choices"`
-	Usage   map[string]interface{}   `json:"usage"`
-	Error   map[string]interface{}   `json:"error"`
-}
-
-type ChoiceItem struct {
-}
-
-type ChatGPTMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-type ChatGPTRequestBody struct {
-	Model       string           `json:"model"`
-	Messages    []ChatGPTMessage `json:"messages"`
-	Temperature float32          `json:"temperature"`
-}
-
-type ImageGenRequestBody struct {
-	Prompt string `json:"prompt"`
-	N      int    `json:"n"`
-	Size   string `json:"size"`
-}
-
-type ImageGenResponseBody struct {
-	Created int                      `json:"created"`
-	Data    []map[string]interface{} `json:"data"`
-	Error   map[string]interface{}   `json:"error"`
-}
-
 var l sync.Mutex
 var msgListMap = make(map[string]*list.List)
 var apiKey string
 var groupIdOnly string
 var storagePath string
+var client *openai.Client
 
 func ImagesGenerations(msg string, role string, group string) ([]string, error) {
-	requestBody := ImageGenRequestBody{
+	req := openai.ImageRequest{
 		Prompt: msg,
 		N:      4,
-		Size:   "1024x1024",
+		Size:   openai.CreateImageSize1024x1024,
+		User:   role,
 	}
-	requestData, err := json.Marshal(requestBody)
+	log.Printf("CreateImage begin: req=%v\n", req)
+	client = openai.NewClient(apiKey)
+	rsp, err := client.CreateImage(context.Background(), req)
+	log.Printf("CreateImage end: err=%v, rsp=%v \n", err, rsp)
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("request gtp json string : %v", string(requestData))
-	req, err := http.NewRequest("POST", "https://api.openai.com/v1/images/generations", bytes.NewBuffer(requestData))
-	if err != nil {
-		return nil, err
+	reply := []string{}
+	for _, v := range rsp.Data {
+		reply = append(reply, v.URL)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	client := &http.Client{}
-	response, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer response.Body.Close()
-
-	body, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	gptResponseBody := &ImageGenResponseBody{}
-	log.Println(string(body))
-	err = json.Unmarshal(body, gptResponseBody)
-	if err != nil {
-		return nil, err
-	}
-	var reply []string
-	if _, ok := gptResponseBody.Error["message"]; ok {
-		reply = append(reply, gptResponseBody.Error["message"].(string))
-		return reply, errors.New(gptResponseBody.Error["message"].(string))
-	}
-	if len(gptResponseBody.Data) > 0 {
-		for _, v := range gptResponseBody.Data {
-			if _, ok := v["url"]; ok {
-				reply = append(reply, v["url"].(string))
-			}
-		}
-	}
-
 	return reply, nil
 }
 
 func ChatCompletions(msg string, role string, group string) ([]string, error) {
-	message := ChatGPTMessage{
+	message := openai.ChatCompletionMessage{
 		Role:    role,
 		Content: msg,
 	}
@@ -121,74 +58,27 @@ func ChatCompletions(msg string, role string, group string) ([]string, error) {
 		msgListMap[group].Remove(msgListMap[group].Front())
 	}
 	msgListMap[group].PushBack(message)
-	messages := []ChatGPTMessage{}
+	messages := []openai.ChatCompletionMessage{}
 	for e := msgListMap[group].Front(); e != nil; e = e.Next() {
-		messages = append(messages, e.Value.(ChatGPTMessage))
+		messages = append(messages, e.Value.(openai.ChatCompletionMessage))
 	}
 	l.Unlock()
 
-	requestBody := ChatGPTRequestBody{
+	req := openai.ChatCompletionRequest{
 		Model:       "gpt-3.5-turbo",
 		Messages:    messages,
 		Temperature: 0.2,
 	}
-	requestData, err := json.Marshal(requestBody)
+	log.Printf("CreateChatCompletion begin: req=%v\n", req)
+	client = openai.NewClient(apiKey)
+	rsp, err := client.CreateChatCompletion(context.Background(), req)
+	log.Printf("CreateChatCompletion end:err=%v, rsp=%v\n", err, rsp)
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("request gtp json string : %v", string(requestData))
-	req, err := http.NewRequest("POST", "https://api.openai.com/v1/chat/completions", bytes.NewBuffer(requestData))
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	client := &http.Client{}
-	response, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer response.Body.Close()
-	body, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	gptResponseBody := &ChatGPTResponseBody{}
-	log.Println(string(body))
-	err = json.Unmarshal(body, gptResponseBody)
-	if err != nil {
-		return nil, err
-	}
-	var reply []string
-	if _, ok := gptResponseBody.Error["message"]; ok {
-		reply = append(reply, gptResponseBody.Error["message"].(string))
-		return reply, errors.New(gptResponseBody.Error["message"].(string))
-	}
-	if len(gptResponseBody.Choices) > 0 {
-		for _, v := range gptResponseBody.Choices {
-			if _, ok := v["message"]; ok {
-				if _, ok := v["message"].(map[string]interface{})["content"]; ok {
-					replyMsg := ChatGPTMessage{
-						Role:    v["message"].(map[string]interface{})["role"].(string),
-						Content: v["message"].(map[string]interface{})["content"].(string),
-					}
-					reply = append(reply, replyMsg.Content)
-					l.Lock()
-					if _, ok := msgListMap[group]; !ok {
-						msgListMap[group] = list.New()
-					}
-					log.Printf("msgListMap[group].len = %d", msgListMap[group].Len())
-					if msgListMap[group].Len() == 10 {
-						msgListMap[group].Remove(msgListMap[group].Front())
-					}
-					msgListMap[group].PushBack(replyMsg)
-					l.Unlock()
-					break
-				}
-			}
-		}
+	reply := []string{}
+	for _, choice := range rsp.Choices {
+		reply = append(reply, choice.Message.Content)
 	}
 	return reply, nil
 }
@@ -277,6 +167,17 @@ func Handler(msg *openwechat.Message) {
 	}
 }
 
+func HttpStart() {
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		len := r.ContentLength
+		body := make([]byte, len)
+		r.Body.Read(body)
+		log.Printf("http body is: %s\n", string(body))
+		w.Write([]byte("Hello, world!"))
+	})
+	log.Printf("%v", http.ListenAndServe("0.0.0.0:80", nil))
+}
+
 func main() {
 	flag.StringVar(&apiKey, "apiKey", "", "")
 	flag.StringVar(&groupIdOnly, "groupIdOnly", "", "")
@@ -286,8 +187,9 @@ func main() {
 		log.Printf("start error: need -apiKey\n")
 		return
 	}
-
 	log.Printf("apiKey = %s, groupIdOnly = %s, storagePath = %s\n", apiKey, groupIdOnly, storagePath)
+	// start http
+	go HttpStart()
 	//bot := openwechat.DefaultBot()
 	bot := openwechat.DefaultBot(openwechat.Desktop) // 桌面模式，上面登录不上的可以尝试切换这种模式
 	// 注册消息处理函数
