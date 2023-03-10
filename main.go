@@ -7,8 +7,13 @@ import (
 	// "encoding/json"
 	// "errors"
 	"flag"
+	"github.com/dobyte/tencent-im"
+	"github.com/dobyte/tencent-im/callback"
+	"github.com/dobyte/tencent-im/group"
+	"github.com/dobyte/tencent-im/private"
 	"github.com/eatmoreapple/openwechat"
 	openai "github.com/sashabaranov/go-openai"
+	tencentyun "github.com/tencentyun/tls-sig-api-v2-golang/tencentyun"
 	// "io/ioutil"
 	"log"
 	"net/http"
@@ -22,8 +27,24 @@ var apiKey string
 var groupIdOnly string
 var storagePath string
 var client *openai.Client
+var timAppId int
+var timSecretKey string
+var tim im.IM
 
-func ImagesGenerations(msg string, role string, group string) ([]string, error) {
+func GetTimUserSign(user string, expire int32) (string, error) {
+	sig, err := tencentyun.GenUserSig(
+		timAppId, timSecretKey,
+		user,
+		int(expire),
+	)
+	if err != nil {
+		log.Printf("GenUserSig failed. err=%v", err)
+		return "", err
+	}
+	return sig, nil
+}
+
+func ImagesGenerations(msg string, role string) ([]string, error) {
 	req := openai.ImageRequest{
 		Prompt: msg,
 		N:      4,
@@ -44,25 +65,38 @@ func ImagesGenerations(msg string, role string, group string) ([]string, error) 
 	return reply, nil
 }
 
-func ChatCompletions(msg string, role string, group string) ([]string, error) {
+func AddHistory(hkey string, msg openai.ChatCompletionMessage) {
+	l.Lock()
+	if _, ok := msgListMap[hkey]; !ok {
+		msgListMap[hkey] = list.New()
+	}
+	log.Printf("msgListMap[hkey].len = %d", msgListMap[hkey].Len())
+	if msgListMap[hkey].Len() == 10 {
+		msgListMap[hkey].Remove(msgListMap[hkey].Front())
+
+	}
+	msgListMap[hkey].PushBack(msg)
+	l.Unlock()
+}
+
+func GetHistory(hkey string) []openai.ChatCompletionMessage {
+	l.Lock()
+	messages := []openai.ChatCompletionMessage{}
+	for e := msgListMap[hkey].Front(); e != nil; e = e.Next() {
+		messages = append(messages, e.Value.(openai.ChatCompletionMessage))
+	}
+	l.Unlock()
+	return messages
+}
+
+func ChatCompletions(msg string, role string, hkey string) ([]string, error) {
 	message := openai.ChatCompletionMessage{
 		Role:    role,
 		Content: msg,
 	}
-	l.Lock()
-	if _, ok := msgListMap[group]; !ok {
-		msgListMap[group] = list.New()
-	}
-	log.Printf("msgListMap[group].len = %d", msgListMap[group].Len())
-	if msgListMap[group].Len() == 10 {
-		msgListMap[group].Remove(msgListMap[group].Front())
-	}
-	msgListMap[group].PushBack(message)
-	messages := []openai.ChatCompletionMessage{}
-	for e := msgListMap[group].Front(); e != nil; e = e.Next() {
-		messages = append(messages, e.Value.(openai.ChatCompletionMessage))
-	}
-	l.Unlock()
+
+	AddHistory(hkey, message)
+	messages := GetHistory(hkey)
 
 	req := openai.ChatCompletionRequest{
 		Model:       "gpt-3.5-turbo",
@@ -79,27 +113,23 @@ func ChatCompletions(msg string, role string, group string) ([]string, error) {
 	reply := []string{}
 	for _, choice := range rsp.Choices {
 		reply = append(reply, choice.Message.Content)
+		AddHistory(hkey, choice.Message)
 	}
 	return reply, nil
 }
 
 func ReplyText(msg *openwechat.Message) error {
 	// 接收群消息
-	// sender, err := msg.Sender()
-	// group := openwechat.Group{sender}
 	log.Printf("Received Sender %s Text Msg : %v", msg.FromUserName, msg.Content)
 	if groupIdOnly != "" && msg.FromUserName != groupIdOnly {
 		return nil
 	}
-	// 不是@的不处理
 	if !msg.IsAt() {
 		return nil
 	}
 	receiver, _ := msg.Receiver()
-	// 替换掉@文本，然后向GPT发起请求
 	replaceText := "@" + receiver.Self().NickName
 	requestText := strings.TrimSpace(strings.ReplaceAll(msg.Content, replaceText, ""))
-	// log.Printf("replace : %s|%s|%s", msg.Content, replaceText, requestText)
 	role := "user"
 	if strings.HasPrefix(requestText, "[system]") == true {
 		requestText = strings.TrimSpace(strings.ReplaceAll(requestText, "[system]", ""))
@@ -113,7 +143,7 @@ func ReplyText(msg *openwechat.Message) error {
 	var replys []string
 	var err error
 	if images == true {
-		replys, err = ImagesGenerations(requestText, role, msg.FromUserName)
+		replys, err = ImagesGenerations(requestText, role)
 	} else {
 		replys, err = ChatCompletions(requestText, role, msg.FromUserName)
 	}
@@ -159,6 +189,125 @@ func ReplyText(msg *openwechat.Message) error {
 	return err
 }
 
+func ImReplyImageToGroup(groupId string, msg string) error {
+	return nil
+}
+
+func ImReplyTextToGroup(groupId string, msg string) error {
+	message := group.NewMessage()
+	message.SetForbidBeforeSendMsgCallback()
+	message.SetForbidAfterSendMsgCallback()
+	message.SetSender("admin")
+	message.SetContent(private.MsgTextContent{
+		Text: msg,
+	})
+	ret, err := tim.Group().SendMessage(groupId, message)
+	if err != nil {
+		log.Printf("im send message group error: %v \n", err)
+		return err
+	}
+	log.Printf("im send message group ret: %v \n", ret)
+	return nil
+}
+
+func AsyncReplyToGroup(groupId string, msg string) error {
+	requestText := strings.TrimSpace(strings.ReplaceAll(msg, "@admin", ""))
+	role := "user"
+	if strings.HasPrefix(requestText, "[system]") == true {
+		requestText = strings.TrimSpace(strings.ReplaceAll(requestText, "[system]", ""))
+		role = "system"
+	}
+	images := false
+	if strings.HasPrefix(requestText, "[images]") == true {
+		requestText = strings.TrimSpace(strings.ReplaceAll(requestText, "[images]", ""))
+		images = true
+	}
+	var replys []string
+	var err error
+	if images == true {
+		replys, err = ImagesGenerations(requestText, role)
+	} else {
+		replys, err = ChatCompletions(requestText, role, groupId)
+	}
+	if len(replys) == 0 {
+		return nil
+	}
+	if err != nil {
+		ImReplyTextToGroup(groupId, err.Error())
+		return nil
+	}
+
+	// 回复
+	for _, reply := range replys {
+		if images == true {
+			ImReplyImageToGroup(groupId, reply)
+		} else {
+			ImReplyTextToGroup(groupId, reply)
+		}
+	}
+	return nil
+}
+
+func ImReplyTextToUser(sender string, userId string, msg string) error {
+	message := private.NewMessage()
+	message.SetSender(sender)
+	message.SetReceivers(userId)
+	message.SetForbidBeforeSendMsgCallback()
+	message.SetForbidAfterSendMsgCallback()
+	message.SetContent(private.MsgTextContent{
+		Text: msg,
+	})
+	ret, err := tim.Private().SendMessage(message)
+	if err != nil {
+		log.Printf("im send message group error: %v \n", err)
+		return err
+	}
+	log.Printf("im send message group ret: %v \n", ret)
+	return nil
+}
+
+func ImReplyImageToUser(sender string, userId string, msg string) error {
+	return nil
+}
+
+func AsyncReplyToUser(sender string, userId string, msg string) error {
+	requestText := msg
+	role := "user"
+	if strings.HasPrefix(requestText, "[system]") == true {
+		requestText = strings.TrimSpace(strings.ReplaceAll(requestText, "[system]", ""))
+		role = "system"
+	}
+	images := false
+	if strings.HasPrefix(requestText, "[images]") == true {
+		requestText = strings.TrimSpace(strings.ReplaceAll(requestText, "[images]", ""))
+		images = true
+	}
+	var replys []string
+	var err error
+	if images == true {
+		replys, err = ImagesGenerations(requestText, role)
+	} else {
+		replys, err = ChatCompletions(requestText, role, userId)
+	}
+	if len(replys) == 0 {
+		return nil
+	}
+	if err != nil {
+		ImReplyTextToUser(sender,userId, err.Error())
+		return nil
+	}
+
+	// 回复
+	for _, reply := range replys {
+		if images == true {
+			ImReplyImageToUser(sender, userId, reply)
+		} else {
+			ImReplyTextToUser(sender, userId, reply)
+		}
+	}
+	return nil
+}
+
 func Handler(msg *openwechat.Message) {
 	log.Printf("hadler Received msg : %v", msg.Content)
 	if msg.IsSendByGroup() {
@@ -168,12 +317,38 @@ func Handler(msg *openwechat.Message) {
 }
 
 func HttpStart() {
+	tim = im.NewIM(&im.Options{
+		AppId:     timAppId,
+		AppSecret: timSecretKey,
+		UserId:    "admin",
+	})
+	tim.Callback()
+	tim.Callback().Register(callback.EventAfterPrivateMessageSend, func(ack callback.Ack, data interface{}) {
+		// log.Printf("%v", data.(callback.AfterPrivateMessageSend))
+		sender := data.(*callback.AfterPrivateMessageSend).FromUserId
+		userId := data.(*callback.AfterPrivateMessageSend).ToUserId
+		for _, msg := range data.(*callback.AfterPrivateMessageSend).MsgBody {
+			if msg.MsgType == "TIMTextElem" && userId == "admin" {
+				text := msg.MsgContent.(map[string]interface{})["Text"].(string)
+				go AsyncReplyToUser(sender, userId, text)
+			}
+		}
+		_ = ack.AckSuccess(0)
+	})
+	tim.Callback().Register(callback.EventAfterGroupMessageSend, func(ack callback.Ack, data interface{}) {
+		groupId := data.(*callback.AfterGroupMessageSend).GroupId
+		for _, msg := range data.(*callback.AfterGroupMessageSend).MsgBody {
+			if msg.MsgType == "TIMTextElem" {
+				text := msg.MsgContent.(map[string]interface{})["Text"].(string)
+				if strings.HasPrefix(text, "@admin") == true {
+					go AsyncReplyToGroup(groupId, text)
+				}
+			}
+		}
+		_ = ack.AckSuccess(0)
+	})
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		len := r.ContentLength
-		body := make([]byte, len)
-		r.Body.Read(body)
-		log.Printf("http body is: %s\n", string(body))
-		w.Write([]byte("Hello, world!"))
+		tim.Callback().Listen(w, r)
 	})
 	log.Printf("%v", http.ListenAndServe("0.0.0.0:80", nil))
 }
@@ -182,12 +357,14 @@ func main() {
 	flag.StringVar(&apiKey, "apiKey", "", "")
 	flag.StringVar(&groupIdOnly, "groupIdOnly", "", "")
 	flag.StringVar(&storagePath, "storagePath", "storage.json", "")
+	flag.StringVar(&timSecretKey, "timSecretKey", "", "")
+	flag.IntVar(&timAppId, "timAppId", 0, "")
 	flag.Parse()
 	if apiKey == "" {
 		log.Printf("start error: need -apiKey\n")
 		return
 	}
-	log.Printf("apiKey = %s, groupIdOnly = %s, storagePath = %s\n", apiKey, groupIdOnly, storagePath)
+	log.Printf("apiKey = %s, groupIdOnly = %s, storagePath = %s, timAppId = %d, timSecretKey = %s\n", apiKey, groupIdOnly, storagePath, timAppId, timSecretKey)
 	// start http
 	go HttpStart()
 	//bot := openwechat.DefaultBot()
